@@ -1,5 +1,5 @@
 #!/usr/bin/env bats
-# Unit tests for buildin-comment.py — anchor lookup and the resplit checks.
+# Unit tests for buildin-comment.py — block-type guard, anchor lookup, resplit checks.
 #
 # Поиск якоря и перенарезка сегментов — место, где ошибка тихая: тред
 # привяжется не к той фразе или незаметно испортит блок. Поэтому здесь чистая
@@ -17,15 +17,16 @@ setup() {
 }
 
 # Документ-фикстура: один блок с заданными сегментами.
-# $1 — segments (JSON), $2 — discussions блока (JSON, по умолчанию пусто).
+# $1 — segments (JSON), $2 — discussions блока (JSON, по умолчанию пусто),
+# $3 — тип блока (по умолчанию 1 = абзац, который гард по типу пропускает).
 mkdoc() {
-    python3 - "$BLOCK" "$SPACE" "$1" "${2:-[]}" > "$DOC" <<'PY'
+    python3 - "$BLOCK" "$SPACE" "$1" "${2:-[]}" "${3:-1}" > "$DOC" <<'PY'
 import json, sys
-block_id, space_id, segments, discussions = sys.argv[1:5]
+block_id, space_id, segments, discussions, btype = sys.argv[1:6]
 print(json.dumps({"data": {"blocks": {block_id: {
     "uuid": block_id,
     "spaceId": space_id,
-    "type": 1,
+    "type": int(btype),
     "discussions": json.loads(discussions),
     "data": {"segments": json.loads(segments), "pageFixedWidth": True},
 }}}}))
@@ -363,4 +364,84 @@ print([(o['command'], o['table']) for o in rec] ==
       any(o.get('path') == ['data'] for o in rec),
       rec[0]['args']['uuid'] == r['discussion'])")
     [ "$result" = "True False True" ]
+}
+
+# --- гард по типу блока -----------------------------------------------------
+#
+# Третий тихий провал рядом с разрывом границы и неоднозначностью: у картинки
+# якорь по имени файла НАХОДИТСЯ, запись проходит, и сверка после записи
+# довольна — сегмент реально несёт discussions. Отсюда и проверка порядка:
+# поймать это можно только ДО поиска якоря.
+
+@test "every whitelisted prose type is accepted" {
+    for t in 1 3 4 5 6 7 12 13 38; do
+        mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]' '[]' "$t"
+        build "beta" "note" >/dev/null || { echo "prose type $t was refused"; return 1; }
+    done
+}
+
+@test "every refused type is rejected by type, not by anchor" {
+    for t in 0 9 14 21 23 25 27 28; do
+        mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]' '[]' "$t"
+        err=$(build_stderr "beta" "note") || true
+        [[ "$err" == *"Блок типа $t"* ]] || { echo "type $t got: $err"; return 1; }
+    done
+}
+
+@test "image block is refused and its segments are shown to be the file name" {
+    mkdoc '[{"text": "picture.png", "type": 0, "enhancer": {}}]' '[]' 14
+    err=$(build_stderr "picture" "note") || true
+    [[ "$err" == *"Блок типа 14 (картинка)"* ]]
+    [[ "$err" == *"имя файла"* ]]
+    [[ "$err" == *"picture.png"* ]]
+}
+
+@test "image block refusal exits non-zero" {
+    mkdoc '[{"text": "picture.png", "type": 0, "enhancer": {}}]' '[]' 14
+    status=0
+    build "picture" "note" >/dev/null 2>&1 || status=$?
+    [ "$status" -ne 0 ]
+}
+
+@test "table and its rows are refused by naming collectionProperties" {
+    for t in 27 28; do
+        mkdoc '[]' '[]' "$t"
+        err=$(build_stderr "cell" "note") || true
+        [[ "$err" == *"collectionProperties"* ]] || { echo "type $t got: $err"; return 1; }
+        [[ "$err" == *"не сработает в принципе"* ]] || { echo "type $t got: $err"; return 1; }
+    done
+}
+
+@test "code and page title are refused for the missing highlight, not for hidden text" {
+    for t in 0 25; do
+        mkdoc '[{"text": "return block_type in ALLOWED", "type": 0, "enhancer": {}}]' '[]' "$t"
+        err=$(build_stderr "block_type in ALLOWED" "note") || true
+        [[ "$err" == *"не подсветится"* ]] || { echo "type $t got: $err"; return 1; }
+    done
+}
+
+@test "unknown block type is refused so a new Buildin type cannot slip through" {
+    mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]' '[]' 99
+    err=$(build_stderr "beta" "note") || true
+    [[ "$err" == *"Блок типа 99 команде неизвестен"* ]]
+    [[ "$err" == *"PROSE_TYPES"* ]]
+}
+
+@test "type guard runs before the anchor lookup" {
+    mkdoc '[{"text": "picture.png", "type": 0, "enhancer": {}}]' '[]' 14
+    err=$(build_stderr "no-such-anchor" "note") || true
+    [[ "$err" == *"Блок типа 14"* ]]
+    [[ "$err" != *"Якоря нет в тексте блока"* ]]
+}
+
+@test "whitelist and refusal map do not overlap" {
+    run python3 -c "
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('bc', sys.argv[1])
+bc = importlib.util.module_from_spec(spec); spec.loader.exec_module(bc)
+both = set(bc.PROSE_TYPES) & set(bc.REFUSED_TYPES)
+print('overlap:', sorted(both))
+sys.exit(1 if both else 0)
+" "$OPS_PY"
+    [ "$status" -eq 0 ]
 }
