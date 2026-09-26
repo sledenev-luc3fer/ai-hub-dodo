@@ -49,6 +49,21 @@ JWT-токен живёт ~30 дней.
 ./integrations/buildin/scripts/buildin.sh GET /api/users/me
 ```
 
+### Как выглядят ошибки
+
+UI API отвечает HTTP 200 почти всегда, а настоящий статус кладёт в поле `code`
+тела. `buildin.sh` смотрит на оба: не-успешный `code` — это ошибка, скрипт
+падает ненулевым кодом и пишет причину в stderr.
+
+```
+$ ./integrations/buildin/scripts/buildin.sh GET /api/blocks/<несуществующий_id>
+Error: Buildin API code 3005: Document not found
+$ echo $?
+1
+```
+
+Ответы без поля `code` и не-JSON тела проходят как раньше.
+
 ## Использование
 
 Все команды принимают UUID или URL buildin.ai:

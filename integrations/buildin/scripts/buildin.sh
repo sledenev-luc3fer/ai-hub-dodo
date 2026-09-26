@@ -75,6 +75,39 @@ if [[ "$http_code" -ge 400 ]]; then
     exit 1
 fi
 
+# UI API кладёт настоящий статус не в HTTP, а в поле `code` тела: на
+# несуществующий документ приходит HTTP 200 и {"code":3005,"msg":"Document not
+# found"}. Без этой проверки вызывающий получает тело ошибки как успешный ответ
+# и идёт дальше — уже с ним вместо данных.
+#
+# Статусом считается только верхнеуровневый `code` у JSON-объекта. Ответ без
+# этого поля, не-JSON и любое тело при отсутствии python3 проходят как раньше:
+# часть ответов статуса не несёт, а клиент обязан оставаться рабочим без
+# python3 — ровно как он уже работает без jq.
+if command -v python3 &> /dev/null; then
+    api_error=$(printf '%s' "$body" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if not isinstance(payload, dict) or "code" not in payload:
+    sys.exit(0)
+code = payload["code"]
+if isinstance(code, bool):
+    sys.exit(0)
+if isinstance(code, str) and code.strip().lstrip("-").isdigit():
+    code = int(code)
+if not isinstance(code, int) or 200 <= code < 300:
+    sys.exit(0)
+print("%s: %s" % (code, payload.get("msg") or payload.get("message") or "no message"))
+' 2>/dev/null)
+    if [[ -n "$api_error" ]]; then
+        echo "Error: Buildin API code $api_error" >&2
+        exit 1
+    fi
+fi
+
 if command -v jq &> /dev/null; then
     echo "$body" | jq . 2>/dev/null || echo "$body"
 else
