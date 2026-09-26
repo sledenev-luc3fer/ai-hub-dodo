@@ -24,7 +24,8 @@ INDEX_FILE="$SCRIPT_DIR/../shadow-index.json"
 # работает полностью локально и без токенов, поэтому отсутствие .env — не повод
 # отказывать в работе, максимум некому подсказать корень дерева.
 _hub_load_env_sh="$SCRIPT_DIR/../../hub-meta/scripts/load-env.sh"
-[[ -f "$_hub_load_env_sh" ]] || _hub_load_env_sh=$(ls "${CLAUDE_PLUGIN_ROOT:-/dev/null}"/../../hub-meta/*/scripts/load-env.sh 2>/dev/null | head -1)
+[[ -f "$_hub_load_env_sh" ]] || _hub_load_env_sh=$(ls "$SCRIPT_DIR"/../../../hub-meta/*/scripts/load-env.sh 2>/dev/null | sort -V | tail -1)
+[[ -f "$_hub_load_env_sh" ]] || _hub_load_env_sh=$(ls "${CLAUDE_PLUGIN_ROOT:-/dev/null}"/../../hub-meta/*/scripts/load-env.sh 2>/dev/null | sort -V | tail -1)
 if [[ -f "$_hub_load_env_sh" ]]; then
     # shellcheck source=../../hub-meta/scripts/load-env.sh
     source "$_hub_load_env_sh"
