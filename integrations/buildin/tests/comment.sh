@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # bash-слой команды `comment` под /bin/bash: разбор аргументов, формы ввода,
-# --dry-run, откат, оптимистичная проверка.
+# --dry-run, откат, поведение при параллельной записи.
 #
 # Зачем отдельно от bats-юнитов: те бьют по чистому питоновскому билдеру, а
-# ошибки разбора аргументов живут в shell. Опечатка «--dryrun», молча ставшая
-# позиционным аргументом, делала боевую запись вместо превью — ровно такой
-# класс багов сюда и ловится. Плюс на macOS /bin/bash = 3.2, целевой шелл
+# ошибки разбора аргументов и склейки живут в shell. Опечатка «--dryrun», молча
+# ставшая позиционным аргументом, делала боевую запись вместо превью — ровно
+# такой класс багов сюда и ловится. Плюс на macOS /bin/bash = 3.2, целевой шелл
 # скриптов хаба, и он проверяется тем же прогоном.
 #
-# buildin.sh застаблен: отвечает канонными JSON, тела запросов пишет в log/.
+# buildin.sh застаблен и ПРИМЕНЯЕТ операции к состоянию: иначе проверку после
+# записи («подсветка закрепилась?») нельзя ни подтвердить, ни опровергнуть.
 set -u
 
 TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +25,6 @@ BLOCK=22222222-2222-4222-8222-222222222222
 SPACE=33333333-3333-4333-8333-333333333333
 OTHER=44444444-4444-4444-4444-444444444444
 
-# ---- песочница: копия скриптов + стаб buildin.sh ----------------------------
 mkdir -p "$TMP/scripts" "$TMP/log"
 cp "$SRC_DIR/buildin-pages.sh" "$SRC_DIR/buildin-comment.py" "$TMP/scripts/"
 
@@ -44,28 +44,56 @@ DOC
 }
 write_fixture
 
-# Стаб buildin.sh: тела транзакций в log/, GET отдаёт состояние, POST его меняет.
-# Состояние настоящее, а не застывшая фикстура: иначе проверку после записи
-# («подсветка закрепилась?») нельзя ни подтвердить, ни опровергнуть.
+# Применение операций к состоянию + режимы имитации чужого писателя.
 cat > "$TMP/scripts/apply-ops.py" <<'APPLY'
-import json, os, sys
+import copy, json, os, sys
+
 state_path, body_path, block_id = sys.argv[1:4]
 state = json.load(open(state_path))
 block = state["data"]["blocks"][block_id]
-for op in json.load(open(body_path))["transactions"][0]["operations"]:
-    if op.get("table") != "block" or op["id"] != block_id:
-        continue
-    if op["command"] == "update" and op.get("path") == ["data"]:
-        block["data"].update(op["args"])
-    elif op["command"] == "listAfter" and op.get("path") == ["discussions"]:
-        block.setdefault("discussions", []).append(op["args"]["uuid"])
-    elif op["command"] == "listRemove" and op.get("path") == ["discussions"]:
-        block["discussions"] = [d for d in block.get("discussions", []) if d != op["args"]["uuid"]]
-drop = os.environ.get("STUB_DROP_HIGHLIGHT")
-if drop:
-    for seg in block["data"].get("segments", []):
-        if drop in (seg.get("discussions") or []):
-            seg["discussions"] = [d for d in seg["discussions"] if d != drop]
+
+
+def foreign_split(segments, uuid_):
+    """Сегменты так, как их записал бы ЧУЖОЙ comment из того же снапшота:
+    свой кусок подсвечен, остальная подсветка снапшота сохранена."""
+    segments = copy.deepcopy(segments)
+    first = segments[0]
+    text = first["text"]
+    head = dict(first, text=text[:11], discussions=[uuid_])
+    tail = dict(first, text=text[11:])
+    tail.pop("discussions", None)
+    return [head, tail] + segments[1:]
+
+
+ops = json.load(open(body_path))["transactions"][0]["operations"]
+before_segments = copy.deepcopy(block["data"].get("segments", []))
+
+# Чужая запись ДО нашей: её подсветку наши сегменты затрут, а в списке она
+# останется (listAfter аддитивен) — так теряют подсветку параллельные треды.
+before_uuid = os.environ.get("STUB_FOREIGN_BEFORE_POST")
+if before_uuid:
+    block["data"]["segments"] = foreign_split(before_segments, before_uuid)
+    block.setdefault("discussions", []).append(before_uuid)
+
+if not os.environ.get("STUB_IGNORE_WRITES"):
+    for op in ops:
+        if op.get("table") != "block" or op["id"] != block_id:
+            continue
+        if op["command"] == "update" and op.get("path") == ["data"]:
+            block["data"].update(op["args"])
+        elif op["command"] == "listAfter" and op.get("path") == ["discussions"]:
+            block.setdefault("discussions", []).append(op["args"]["uuid"])
+        elif op["command"] == "listRemove" and op.get("path") == ["discussions"]:
+            block["discussions"] = [d for d in block.get("discussions", []) if d != op["args"]["uuid"]]
+
+# Чужая запись ПОСЛЕ нашей, построенная из ДОнашего снапшота: затирает нашу
+# подсветку — так проигрывают гонку.
+after_uuid = os.environ.get("STUB_FOREIGN_AFTER_POST")
+if after_uuid and any(o["command"] == "update" and o.get("path") == ["data"] for o in ops):
+    block["data"]["segments"] = foreign_split(before_segments, after_uuid)
+    if after_uuid not in block.get("discussions", []):
+        block.setdefault("discussions", []).append(after_uuid)
+
 json.dump(state, open(state_path, "w"), ensure_ascii=False)
 APPLY
 
@@ -76,9 +104,12 @@ METHOD="\$1"; ENDPOINT="\$2"; BODY="\${3:-}"
 LOG_DIR="$TMP/log"
 case "\$ENDPOINT" in
     /api/users/me)             echo '{"code":200,"data":{"uuid":"user-1"}}' ;;
-    /api/docs/*)               cat "$TMP/state.json" ;;
-    /api/records/transactions) printf '%s' "\$BODY" > "\$LOG_DIR/tx-body.json"
-                               [ -z "\${STUB_IGNORE_WRITES:-}" ] && python3 "$TMP/scripts/apply-ops.py" \
+    /api/docs/*)               [ -n "\${STUB_FAIL_GET_AFTER_WRITE:-}" ] && [ -s "\$LOG_DIR/tx-body.json" ] && {
+                                   echo "Error: HTTP 503" >&2; exit 1; }
+                               cat "$TMP/state.json" ;;
+    /api/records/transactions) printf '%s' "\$BODY" >> "\$LOG_DIR/tx-all.json"
+                               printf '%s' "\$BODY" > "\$LOG_DIR/tx-body.json"
+                               python3 "$TMP/scripts/apply-ops.py" \\
                                    "$TMP/state.json" "\$LOG_DIR/tx-body.json" "$BLOCK"
                                echo '{"code":200,"data":true}' ;;
     *)                         echo '{"code":404}' ;;
@@ -90,22 +121,34 @@ restore_stateful_stub
 
 # Прогон команды под /bin/bash. Печатает rc; stdout/stderr — в log/.
 run_comment() {
-    rm -f "$TMP/log/tx-body.json"
+    rm -f "$TMP/log/tx-body.json" "$TMP/log/tx-all.json"
     [ -n "${SKIP_RESET:-}" ] || write_fixture
     /bin/bash "$TMP/scripts/buildin-pages.sh" comment "$@" \
         > "$TMP/log/stdout.txt" 2> "$TMP/log/stderr.txt"
     echo $?
 }
+run_cmd() { # произвольная подкоманда — для регресса comments
+    /bin/bash "$TMP/scripts/buildin-pages.sh" "$@" > "$TMP/log/stdout.txt" 2> "$TMP/log/stderr.txt"
+    echo $?
+}
 sent()   { [ -s "$TMP/log/tx-body.json" ]; }
 stderr() { cat "$TMP/log/stderr.txt"; }
 stdout() { cat "$TMP/log/stdout.txt"; }
+block_state() { python3 -c "
+import json, sys
+b = json.load(open('$TMP/state.json'))['data']['blocks']['$BLOCK']
+segs = b['data']['segments']
+lit = {t for s in segs for t in (s.get('discussions') or [])}
+print(json.dumps({'listed': b.get('discussions', []), 'lit': sorted(lit),
+                  'text': ''.join(s['text'] for s in segs), 'n': len(segs)}, ensure_ascii=False))
+"; }
 
-# ---- P1 #1: неизвестные флаги не должны становиться позиционными ------------
+# ---- P1 #1 (раунд 1): неизвестные флаги не становятся позиционными ----------
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' --dryrun)
 if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'неизвестный флаг'; then
     ok "опечатка --dryrun отвергнута, боевой записи нет"
 else
-    fail "опечатка --dryrun не отвергнута (rc=$RC, записал=$(sent && echo да || echo нет))"
+    fail "опечатка --dryrun не отвергнута (rc=$RC)"
 fi
 
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' --rollback-out "$TMP/mine.json")
@@ -115,6 +158,22 @@ else
     fail "пробельная форма --rollback-out не сработала (rc=$RC): $(stderr)"
 fi
 
+# Пустая переменная не должна съедать следующий флаг: так --dry-run становился
+# путём, и превью превращалось в боевую запись.
+EMPTY=""
+RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' --rollback-out $EMPTY --dry-run)
+if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'rollback-out без значения'; then
+    ok "--rollback-out с пустым значением не съедает следующий флаг"
+else
+    fail "--rollback-out съел --dry-run (rc=$RC, записал=$(sent && echo да || echo нет))"
+fi
+RC=$(run_comment "$PAGE" "$BLOCK" 'лимит' 'текст' --occurrence $EMPTY --dry-run)
+if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'occurrence без значения'; then
+    ok "--occurrence с пустым значением не съедает следующий флаг"
+else
+    fail "--occurrence съел --dry-run (rc=$RC)"
+fi
+
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' 'лишний')
 if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'ровно <anchor> и <text>'; then
     ok "лишний позиционный аргумент отвергнут"
@@ -122,7 +181,21 @@ else
     fail "лишний позиционный аргумент не отвергнут (rc=$RC)"
 fi
 
-# ---- P2 #6: --dry-run не трогает ни сеть, ни диск ---------------------------
+RC=$(run_comment "$PAGE" 'в минуту' 'текст')
+if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'не указан block_id'; then
+    ok "отсутствие block_id названо своим именем"
+else
+    fail "отсутствие block_id не отвергнуто внятно (rc=$RC): $(stderr | head -1)"
+fi
+
+RC=$(run_comment "https://buildin.ai/$SPACE/$PAGE#$BLOCK" 'в минуту' 'текст')
+if [ "$RC" -eq 0 ] && sent; then
+    ok "форма <url>#<block_uuid> принята"
+else
+    fail "форма <url>#<block_uuid> не сработала (rc=$RC): $(stderr | head -2)"
+fi
+
+# ---- #6 (раунд 1): --dry-run не отправляет и не пишет файл отката -----------
 RB="$TMP/dry-rollback.json"
 printf 'прежний откат' > "$RB"
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' --dry-run "--rollback-out=$RB")
@@ -146,7 +219,7 @@ else
     fail "--dry-run напечатал не то: $(stdout | head -3)"
 fi
 
-# ---- P3 #11: пустой текст/якорь после разворачивания -------------------------
+# ---- #11 (раунд 1): пустые значения после разворачивания ---------------------
 : > "$TMP/empty.txt"
 RC=$(printf '' | run_comment "$PAGE" "$BLOCK" 'в минуту' -)
 if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'текст комментария пустой'; then
@@ -161,7 +234,7 @@ else
     fail "пустой файл как текст не отвергнут (rc=$RC)"
 fi
 
-# ---- P2 #5: неоднозначный якорь ---------------------------------------------
+# ---- #5 (раунд 1) + #9 (раунд 2): однозначность якоря ------------------------
 RC=$(run_comment "$PAGE" "$BLOCK" 'лимит' 'текст')
 if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'раз(а) — непонятно'; then
     ok "неоднозначный якорь отвергнут"
@@ -174,6 +247,12 @@ if [ "$RC" -eq 0 ] && sent; then
 else
     fail "--occurrence=2 не сработал (rc=$RC): $(stderr | head -2)"
 fi
+RC=$(run_comment "$PAGE" "$BLOCK" 'лимит' 'текст' --occurrence 2)
+if [ "$RC" -eq 0 ] && sent; then
+    ok "пробельная форма --occurrence N принята"
+else
+    fail "пробельная форма --occurrence N не сработала (rc=$RC): $(stderr | head -2)"
+fi
 RC=$(run_comment "$PAGE" "$BLOCK" 'лимит' 'текст' --occurrence=0)
 if [ "$RC" -ne 0 ] && ! sent; then
     ok "--occurrence=0 отвергнут"
@@ -181,10 +260,10 @@ else
     fail "--occurrence=0 не отвергнут (rc=$RC)"
 fi
 
-# ---- P3 #8: экранирование сигилов -------------------------------------------
+# ---- #8 (раунд 1) + #3 (раунд 2): сигилы и ведущие дефисы --------------------
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' '@@j.doe глянь сюда')
 if [ "$RC" -eq 0 ] && sent && python3 -c "
-import json, sys
+import json
 ops = json.load(open('$TMP/log/tx-body.json'))['transactions'][0]['operations']
 assert ops[1]['args']['text'][0]['text'] == '@j.doe глянь сюда'
 " 2>/dev/null; then
@@ -198,101 +277,151 @@ if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'удвойте сигил'; th
 else
     fail "ошибка про @ не объясняет обходной путь"
 fi
-
-# ---- #4: проверка ДО записи — блок изменился между GET и POST ---------------
-# Стаб отдаёт исходный документ на первый GET и изменённый на последующие:
-# имитация чужой правки, пришедшей пока готовился комментарий.
-cat > "$TMP/state-changed.json" <<DOC
-{"code":200,"data":{"blocks":{"$BLOCK":{
-  "uuid":"$BLOCK","spaceId":"$SPACE","type":1,"discussions":[],
-  "data":{"pageFixedWidth":true,
-    "segments":[{"text":"кто-то переписал блок, но фраза в минуту цела","type":0,"enhancer":{}}]}}}}}
-DOC
-cat > "$TMP/scripts/buildin.sh" <<STUB2
-#!/usr/bin/env bash
-METHOD="\$1"; ENDPOINT="\$2"; BODY="\${3:-}"
-LOG_DIR="$TMP/log"
-case "\$ENDPOINT" in
-    /api/users/me)             echo '{"code":200,"data":{"uuid":"user-1"}}' ;;
-    /api/docs/*)               N=\$(cat "\$LOG_DIR/getn" 2>/dev/null || echo 0); N=\$((N + 1))
-                               echo "\$N" > "\$LOG_DIR/getn"
-                               if [ "\$N" -le 1 ]; then cat "$TMP/state.json"; else cat "$TMP/state-changed.json"; fi ;;
-    /api/records/transactions) printf '%s' "\$BODY" > "\$LOG_DIR/tx-body.json"
-                               echo '{"code":200,"data":true}' ;;
-    *)                         echo '{"code":404}' ;;
-esac
-STUB2
-chmod +x "$TMP/scripts/buildin.sh"
-rm -f "$TMP/log/getn"
-RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
-if [ "$RC" -ne 0 ] && ! sent && stderr | grep -q 'блок изменился'; then
-    ok "правка блока между GET и POST отменяет запись"
-else
-    fail "конкурентная правка не отменила запись (rc=$RC): $(stderr | head -2)"
-fi
-
-# ---- #4: проверка ПОСЛЕ записи ----------------------------------------------
-# Проверка до записи сужает окно, но не закрывает: несколько процессов успевают
-# сделать оба GET раньше первого POST (воспроизведено на живой странице —
-# из трёх параллельных комментариев двое теряли подсветку). Поэтому результат
-# сверяется по факту, и тихая потеря становится громкой.
-restore_stateful_stub
-
-# а) наша подсветка не закрепилась: стаб принимает запись, но состояние не меняет
-export STUB_IGNORE_WRITES=1
-RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
-unset STUB_IGNORE_WRITES
-if [ "$RC" -ne 0 ] && sent && stderr | grep -q 'подсветка не закрепилась'; then
-    ok "незакрепившаяся подсветка своего треда — громкая ошибка"
-else
-    fail "незакрепившаяся подсветка не обнаружена (rc=$RC): $(stderr | head -2)"
-fi
-
-# б) чужой тред был подсвечен, а после нашей записи подсветку потерял —
-#    ровно то, что случилось на живой странице при трёх параллельных прогонах
-write_fixture
-python3 -c "
+RC=$(run_comment "$PAGE" "$BLOCK" -- 'в минуту' '-- не согласен')
+if [ "$RC" -eq 0 ] && sent && python3 -c "
 import json
-p = '$TMP/state.json'
-st = json.load(open(p))
-b = st['data']['blocks']['$BLOCK']
-b['discussions'] = ['$OTHER']
-b['data']['segments'][1]['discussions'] = ['$OTHER']
-json.dump(st, open(p, 'w'), ensure_ascii=False)
-"
-export STUB_DROP_HIGHLIGHT="$OTHER"
-RC=$(SKIP_RESET=1 run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
-unset STUB_DROP_HIGHLIGHT
+ops = json.load(open('$TMP/log/tx-body.json'))['transactions'][0]['operations']
+assert ops[1]['args']['text'][0]['text'] == '-- не согласен', ops[1]['args']['text']
+" 2>/dev/null; then
+    ok "текст с ведущими дефисами доходит через разделитель --"
+else
+    fail "текст с ведущими дефисами не дошёл (rc=$RC): $(stderr | head -2)"
+fi
+printf -- '-- не согласен' > "$TMP/dashes.txt"
+RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' "@$TMP/dashes.txt")
+if [ "$RC" -eq 0 ] && sent && python3 -c "
+import json
+ops = json.load(open('$TMP/log/tx-body.json'))['transactions'][0]['operations']
+assert ops[1]['args']['text'][0]['text'] == '-- не согласен', ops[1]['args']['text']
+" 2>/dev/null; then
+    ok "текст с ведущими дефисами доходит через @file"
+else
+    fail "текст с ведущими дефисами не дошёл через @file (rc=$RC): $(stderr | head -2)"
+fi
+
+# ---- #7 (раунд 2): файл отката разбирается и проигрывается -------------------
+RB2="$TMP/rb-real.json"
+RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст' "--rollback-out=$RB2")
+BEFORE=$(python3 -c "print('безлимитный тариф: лимит 100 запросов в минуту')")
+if [ "$RC" -eq 0 ] && python3 -c "
+import json, sys
+b = json.load(open('$RB2'))
+tx = b['transactions'][0]
+assert tx['spaceId'] == '$SPACE', tx['spaceId']
+assert isinstance(b['requestId'], str) and b['requestId']
+got = [(o['command'], o['table'], '.'.join(o['path'])) for o in tx['operations']]
+want = [('update','block','data'), ('listRemove','block','discussions'),
+        ('update','comment',''), ('update','discussion',''), ('update','block','')]
+assert got == want, got
+" 2>/dev/null; then
+    ok "файл отката — валидный конверт с ожидаемыми операциями"
+else
+    fail "файл отката не разобрался: $(head -c 200 "$RB2" 2>/dev/null)"
+fi
+# проигрываем откат через стаб и смотрим, что блок вернулся
+/bin/bash "$TMP/scripts/buildin.sh" POST /api/records/transactions "$(cat "$RB2")" > /dev/null 2>&1
+ST=$(block_state)
+if echo "$ST" | python3 -c "
+import json, sys
+st = json.load(sys.stdin)
+assert st['listed'] == [], st['listed']
+assert st['lit'] == [], st['lit']
+assert st['text'] == '$BEFORE', st['text']
+assert st['n'] == 3, st['n']
+" 2>/dev/null; then
+    ok "проигранный откат вернул блок к снапшоту и убрал тред"
+else
+    fail "откат не вернул блок: $ST"
+fi
+
+# ---- #6 (раунд 2): сбой GET после успешной записи ---------------------------
+write_fixture
+export STUB_FAIL_GET_AFTER_WRITE=1
+RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
+unset STUB_FAIL_GET_AFTER_WRITE
+if [ "$RC" -eq 2 ] && sent && stderr | grep -q 'discussion:' && stderr | grep -q 'Не повторяйте команду вслепую'; then
+    ok "сбой GET после записи называет созданный тред и запрещает слепой повтор"
+else
+    fail "сбой GET после записи обработан молча (rc=$RC): $(stderr | tail -3)"
+fi
+
+# ---- #2 (раунд 2): чужой тред, созданный ПАРАЛЛЕЛЬНО, теряет подсветку -------
+# Чужая запись ложится до нашей из того же снапшота: в снапшоте команды её нет,
+# и прежняя база сравнения (подсветка снапшота) этот случай пропускала.
+write_fixture
+export STUB_FOREIGN_BEFORE_POST="$OTHER"
+RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
+unset STUB_FOREIGN_BEFORE_POST
 if [ "$RC" -eq 0 ] && sent && stderr | grep -q "лишила подсветки чужие треды: $OTHER"; then
-    ok "потерявший подсветку чужой тред назван в предупреждении"
+    ok "тред, созданный параллельно и потерявший подсветку, назван в предупреждении"
 else
-    fail "чужой тред без подсветки не отмечен (rc=$RC): $(stderr | head -3)"
+    fail "параллельно созданный тред не замечен (rc=$RC): $(stderr | tail -3)"
 fi
 
-# в) давно осиротевший чужой тред (в списке, но без подсветки ещё до нас) —
-#    не наша вина и не повод для тревоги
+# ---- #1 (раунд 2): проигрыш гонки чинится узким откатом ----------------------
+# Чужая запись ложится ПОСЛЕ нашей и затирает нашу подсветку. Полный откат тут
+# применять нельзя: он вернул бы наш снапшот и стёр подсветку победителя.
 write_fixture
-python3 -c "
-import json
-p = '$TMP/state.json'
-st = json.load(open(p))
-st['data']['blocks']['$BLOCK']['discussions'] = ['$OTHER']
-json.dump(st, open(p, 'w'), ensure_ascii=False)
-"
-RC=$(SKIP_RESET=1 run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
-if [ "$RC" -eq 0 ] && ! stderr | grep -q 'ВНИМАНИЕ'; then
-    ok "давно осиротевший тред не даёт ложной тревоги"
-else
-    fail "ложная тревога на давно осиротевшем треде (rc=$RC): $(stderr | head -3)"
-fi
-
-# г) happy path: наша подсветка на месте, предупреждений нет
-write_fixture
+export STUB_FOREIGN_AFTER_POST="$OTHER"
 RC=$(run_comment "$PAGE" "$BLOCK" 'в минуту' 'текст')
-if [ "$RC" -eq 0 ] && sent && ! stderr | grep -q 'ВНИМАНИЕ'; then
-    ok "обычная запись проходит без предупреждений"
+unset STUB_FOREIGN_AFTER_POST
+if [ "$RC" -ne 0 ] && stderr | grep -q 'подсветка не закрепилась'; then
+    ok "проигрыш гонки — громкая ошибка"
 else
-    fail "обычная запись дала предупреждение (rc=$RC): $(stderr | head -3)"
+    fail "проигрыш гонки не обнаружен (rc=$RC): $(stderr | tail -3)"
+fi
+if stderr | grep -q 'применять НЕ надо'; then
+    ok "команда предупреждает не применять полный откат"
+else
+    fail "команда не предупредила про полный откат: $(stderr | tail -3)"
+fi
+if python3 -c "
+import json
+bodies = open('$TMP/log/tx-all.json').read()
+# второй конверт в логе — узкий откат, отправленный самой командой
+import re
+objs, depth, start = [], 0, None
+for i, ch in enumerate(bodies):
+    if ch == '{':
+        if depth == 0: start = i
+        depth += 1
+    elif ch == '}':
+        depth -= 1
+        if depth == 0: objs.append(bodies[start:i+1])
+assert len(objs) == 2, len(objs)
+ops = json.loads(objs[1])['transactions'][0]['operations']
+assert not any(o.get('path') == ['data'] for o in ops), ops
+assert [o['command'] for o in ops] == ['listRemove','update','update','update'], ops
+" 2>/dev/null; then
+    ok "в ветке гонки отправлен узкий откат без операции по segments"
+else
+    fail "узкий откат не отправлен или содержит запись сегментов"
+fi
+ST=$(block_state)
+if echo "$ST" | python3 -c "
+import json, sys
+st = json.load(sys.stdin)
+assert st['lit'] == ['$OTHER'], st['lit']          # подсветка победителя цела
+assert st['listed'] == ['$OTHER'], st['listed']    # наш тред снят со списка
+" 2>/dev/null; then
+    ok "после самоочистки подсветка победителя цела, наш тред снят"
+else
+    fail "самоочистка повредила состояние: $ST"
+fi
+
+# ---- регресс: comments после выноса parse_page_and_block_id ------------------
+write_fixture
+RC=$(run_cmd comments "$PAGE" "$BLOCK")
+if [ "$RC" -eq 0 ]; then
+    ok "comments принимает <page> <block>"
+else
+    fail "comments сломан на <page> <block> (rc=$RC): $(stderr | head -2)"
+fi
+RC=$(run_cmd comments "https://buildin.ai/$SPACE/$PAGE#$BLOCK")
+if [ "$RC" -eq 0 ]; then
+    ok "comments принимает <url>#<block_uuid>"
+else
+    fail "comments сломан на якоре в URL (rc=$RC): $(stderr | head -2)"
 fi
 
 echo "---"

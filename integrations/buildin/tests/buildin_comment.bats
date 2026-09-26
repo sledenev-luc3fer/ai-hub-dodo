@@ -79,6 +79,28 @@ elif how == "insert-empty":
         out.insert(i, dict(out[i], text="", discussions=[]))
         return out
     bc.split_segments = broken
+elif how == "extra-segments":
+    # текст сохраняем, но дробим хвост — меняется только ЧИСЛО сегментов
+    def broken(s, i, p, a, d):
+        out = orig(s, i, p, a, d)
+        tail = out[i + 2]
+        out[i + 2:i + 3] = [dict(tail, text=tail["text"][:1]), dict(tail, text=tail["text"][1:])]
+        return out
+    bc.split_segments = broken
+elif how == "tag-neighbor":
+    # тред вешается ещё и на соседний кусок разреза
+    def broken(s, i, p, a, d):
+        out = orig(s, i, p, a, d)
+        out[i]["discussions"] = [d]
+        return out
+    bc.split_segments = broken
+elif how == "touch-neighbor":
+    # сегмент ВНЕ разреза меняется, текст при этом целый
+    def broken(s, i, p, a, d):
+        out = orig(s, i, p, a, d)
+        out[-1] = dict(out[-1], enhancer={"bold": True})
+        return out
+    bc.split_segments = broken
 try:
     bc.build_ops(block, block_id, anchor, "t", 1, "u")
     print("НЕ ПОЙМАЛ")
@@ -281,4 +303,64 @@ print('|'.join(s['text'] for s in seg_op['args']['segments']),
     mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]'
     result=$(python3 "$OPS_PY" - "$BLOCK" "beta" "note" "$NOW" "$USER" < "$DOC" 2>/dev/null | probe "print(len(ops))")
     [ "$result" = "5" ]
+}
+
+@test "resplit check catches a split that changes the segment count" {
+    mkdoc '[{"text": "alpha beta gamma", "type": 0, "enhancer": {}}]'
+    result=$(build_broken "extra-segments" "beta")
+    [[ "$result" == *"изменила число сегментов"* ]]
+}
+
+@test "resplit check catches a split that tags more than one part" {
+    mkdoc '[{"text": "alpha beta gamma", "type": 0, "enhancer": {}}]'
+    result=$(build_broken "tag-neighbor" "beta")
+    [[ "$result" == *"ровно на одном новом сегменте"* ]]
+}
+
+@test "resplit check catches a split that touches a neighbouring segment" {
+    mkdoc '[{"text": "alpha beta gamma", "type": 0, "enhancer": {}}, {"text": " tail", "type": 0, "enhancer": {}}]'
+    result=$(build_broken "touch-neighbor" "beta")
+    [[ "$result" == *"задела соседние сегменты"* ]]
+}
+
+# ---- неоднозначность: перекрывающиеся вхождения ------------------------------
+
+@test "overlapping occurrences count as ambiguous" {
+    mkdoc '[{"text": "банана", "type": 0, "enhancer": {}}]'
+    err=$(build_stderr "ана" "note") || true
+    [[ "$err" == *"встречается в блоке 2 раз(а)"* ]]
+}
+
+@test "overlapping occurrence is selectable" {
+    mkdoc '[{"text": "банана", "type": 0, "enhancer": {}}]'
+    result=$(build "ана" "note" --occurrence=2 | probe "print('|'.join(s['text'] for s in seg_op['args']['segments']))")
+    [ "$result" = "бан|ана" ]
+}
+
+# ---- значения с ведущими дефисами -------------------------------------------
+
+@test "values starting with dashes survive after the end-of-options marker" {
+    mkdoc '[{"text": "флаг --force включает режим", "type": 0, "enhancer": {}}]'
+    result=$(python3 "$OPS_PY" -- "$DOC" "$BLOCK" "--force" "-- не согласен" "$NOW" "$USER" 2>/dev/null \
+        | probe "print('|'.join(s['text'] for s in seg_op['args']['segments']), repr(comment['args']['text'][0]['text']))")
+    [ "$result" = "флаг |--force| включает режим '-- не согласен'" ]
+}
+
+@test "unknown flag before the marker is still rejected" {
+    mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]'
+    err=$(python3 "$OPS_PY" --nope -- "$DOC" "$BLOCK" "beta" "note" "$NOW" "$USER" 2>&1 >/dev/null) || true
+    [[ "$err" == *"неизвестный флаг: --nope"* ]]
+}
+
+# ---- узкий откат для проигравшего гонку --------------------------------------
+
+@test "records-only rollback carries no segment write" {
+    mkdoc '[{"text": "alpha beta", "type": 0, "enhancer": {}}]'
+    result=$(build "beta" "note" | probe "
+rec = r['rollback_records']
+print([(o['command'], o['table']) for o in rec] ==
+      [('listRemove','block'),('update','comment'),('update','discussion'),('update','block')],
+      any(o.get('path') == ['data'] for o in rec),
+      rec[0]['args']['uuid'] == r['discussion'])")
+    [ "$result" = "True False True" ]
 }

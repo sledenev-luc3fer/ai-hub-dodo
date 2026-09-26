@@ -20,7 +20,8 @@
 #           [--dry-run] [--occurrence=N] [--rollback-out=<path>]
 #                                                — создать комментарий к фразе <anchor> внутри блока
 #                                                  <anchor>/<text>: строка, «@путь» — файл, «-» — stdin
-#                                                  («@@текст» — литеральный «@текст», «--» — литеральный «-»)
+#                                                  («@@текст» — литеральный «@текст»; значение с ведущими
+#                                                   дефисами — после разделителя «--»)
 #                                                  якорь должен быть однозначен: несколько вхождений —
 #                                                  отказ, нужное выбирается через --occurrence=N
 #   publish-md <page_id> <file.md> [--replace]          — опубликовать markdown-файл
@@ -57,14 +58,15 @@ parse_id() {
 # иначе строка как есть. Длинный текст комментария в bash-строке — ад
 # экранирования, поэтому у него есть файловая форма.
 #
-# Сигилы экранируются удвоением: «@@текст» — литеральный «@текст», «--» —
-# литеральный «-». Без этого комментарий, начинающийся с упоминания, передать
-# было бы нечем: он молча уезжал бы в ветку «файл».
+# Сигил «@» экранируется удвоением: «@@текст» — литеральный «@текст». Без
+# этого комментарий, начинающийся с упоминания, передать было бы нечем: он
+# молча уезжал бы в ветку «файл». У «-» своего escape нет намеренно — «--»
+# занято разделителем конца опций; значение, равное одному дефису, берётся
+# из файла или stdin.
 read_arg_text() {
     local value="$1"
     case "$value" in
         -)   cat ;;
-        --)  printf '%s' '-' ;;
         @@*) printf '%s' "${value#@}" ;;
         @*)  local file="${value#@}"
              [[ -f "$file" ]] || {
@@ -127,7 +129,7 @@ print(json.dumps({
         'spaceId': sys.argv[4],
         'operations': ops
     }]
-}, ensure_ascii=False))
+}))
 " "$OPERATIONS" "$(gen_uuid)" "$(gen_uuid)" "$SPACE_ID"
 }
 
@@ -135,7 +137,11 @@ print(json.dumps({
 transaction() {
     local SPACE_ID="$1"
     local OPERATIONS="$2"
-    buildin POST "/api/records/transactions" "$(tx_body "$SPACE_ID" "$OPERATIONS")"
+    # Тело собираем отдельным присваиванием, а не подстановкой прямо в аргументе:
+    # при подстановке сбой сборки прячется от set -e и POST уходит с пустым телом.
+    local body
+    body=$(tx_body "$SPACE_ID" "$OPERATIONS")
+    buildin POST "/api/records/transactions" "$body"
 }
 
 COMMAND="${1:-help}"
@@ -437,7 +443,8 @@ if not found:
     comment)
         USAGE='Usage: comment <page_id|url[#block_id]> [block_id] <anchor> <text> [--dry-run] [--occurrence=N] [--rollback-out=<path>]
   <anchor>, <text>: строка, «@путь» — содержимое файла, «-» — stdin
-                    («@@текст» — литеральный «@текст», «--» — литеральный «-»)'
+                    («@@текст» — литеральный «@текст»; значение с ведущими
+                     дефисами — после разделителя «--»)'
         INPUT="$1"
         [[ -z "$INPUT" ]] && { echo "$USAGE" >&2; exit 1; }
         shift
@@ -452,9 +459,13 @@ if not found:
             case "$1" in
                 --dry-run)         DRY_RUN=1 ;;
                 --occurrence=*)    OCCURRENCE="${1#*=}" ;;
-                --occurrence)      shift; OCCURRENCE="${1:-}" ;;
+                --occurrence)      shift; OCCURRENCE="${1:-}"
+                                   [[ -n "$OCCURRENCE" && "$OCCURRENCE" != --* ]] || {
+                                       echo "Error: --occurrence без значения" >&2; exit 1; } ;;
                 --rollback-out=*)  ROLLBACK_OUT="${1#*=}" ;;
-                --rollback-out)    shift; ROLLBACK_OUT="${1:-}" ;;
+                --rollback-out)    shift; ROLLBACK_OUT="${1:-}"
+                                   [[ -n "$ROLLBACK_OUT" && "$ROLLBACK_OUT" != --* ]] || {
+                                       echo "Error: --rollback-out без значения" >&2; exit 1; } ;;
                 --)                shift; while [[ $# -gt 0 ]]; do ARGS+=("$1"); shift; done; break ;;
                 --*)               echo "Error: неизвестный флаг: $1" >&2; echo "$USAGE" >&2; exit 1 ;;
                 *)                 ARGS+=("$1") ;;
@@ -485,15 +496,18 @@ if not found:
 
         DOC_FILE=$(mktemp)
         FRESH_FILE=""
-        trap 'rm -f "$DOC_FILE" ${FRESH_FILE:+"$FRESH_FILE"}' EXIT
+        OPS_DIR=""
+        trap 'rm -rf "$DOC_FILE" ${FRESH_FILE:+"$FRESH_FILE"} ${OPS_DIR:+"$OPS_DIR"}' EXIT
 
         buildin GET "/api/docs/$PAGE_ID" > "$DOC_FILE"
         NOW=$(python3 -c "import time; print(int(time.time()*1000))")
         USER_ID=$(buildin GET "/api/users/me" | python3 -c "import sys,json; print(json.load(sys.stdin).get('data',{}).get('uuid',''))")
 
+        # «--» обязателен: без него якорь или текст с ведущими дефисами билдер
+        # примет за флаг, и файловая форма ввода от этого не спасает.
         BUILT=$(python3 "$SCRIPT_DIR/buildin-comment.py" \
-            "$DOC_FILE" "$BLOCK_ID" "$ANCHOR" "$TEXT" "$NOW" "$USER_ID" \
-            ${OCCURRENCE:+--occurrence="$OCCURRENCE"})
+            ${OCCURRENCE:+--occurrence="$OCCURRENCE"} -- \
+            "$DOC_FILE" "$BLOCK_ID" "$ANCHOR" "$TEXT" "$NOW" "$USER_ID")
 
         if [[ -n "$DRY_RUN" ]]; then
             # Превью не трогает ни сеть, ни диск: файл отката по дефолтному пути
@@ -527,45 +541,82 @@ if segs(sys.argv[1]) != segs(sys.argv[2]):
 " "$DOC_FILE" "$FRESH_FILE" "$BLOCK_ID"
 
         [[ -n "$ROLLBACK_OUT" ]] || ROLLBACK_OUT=$(mktemp "${TMPDIR:-/tmp}/buildin-rollback-XXXXXX")
-        tx_body "$SPACE_ID" "$(echo "$BUILT" | python3 -c "
-import json, sys
-print(json.dumps(json.load(sys.stdin)['rollback'], ensure_ascii=False))")" > "$ROLLBACK_OUT"
+        OPS_DIR=$(mktemp -d)
+        DISCUSSION=$(echo "$BUILT" | python3 -c "
+import json, os, sys
+out = sys.argv[1]
+built = json.load(sys.stdin)
+for key in ('ops', 'rollback', 'rollback_records'):
+    open(os.path.join(out, key + '.json'), 'w').write(json.dumps(built[key]))
+print(built['discussion'])
+" "$OPS_DIR")
+
+        ROLLBACK_BODY=$(tx_body "$SPACE_ID" "$(cat "$OPS_DIR/rollback.json")")
+        printf '%s\n' "$ROLLBACK_BODY" > "$ROLLBACK_OUT"
         echo "Откат: $ROLLBACK_OUT" >&2
 
-        DISCUSSION=$(echo "$BUILT" | python3 -c "import json, sys; print(json.load(sys.stdin)['discussion'])")
-        transaction "$SPACE_ID" "$(echo "$BUILT" | python3 -c "
-import json, sys
-print(json.dumps(json.load(sys.stdin)['ops'], ensure_ascii=False))")"
+        transaction "$SPACE_ID" "$(cat "$OPS_DIR/ops.json")"
+        # О созданном треде сообщаем сразу после записи, до любых проверок:
+        # это единственный необратимый эффект команды, и если следующий шаг
+        # упадёт, повтор вслепую создаст второй тред на той же фразе.
+        echo "discussion: $DISCUSSION" >&2
 
         # Проверка ПОСЛЕ записи. Проверка до неё сужает окно, но не закрывает:
         # несколько процессов успевают сделать оба GET раньше первого POST, и
-        # тогда побеждает последний писавший segments. Молча терять подсветку
-        # нельзя, поэтому результат сверяется по факту.
-        buildin GET "/api/docs/$PAGE_ID" > "$FRESH_FILE"
-        python3 -c "
+        # тогда побеждает последний писавший segments.
+        FRESH_FILE=$(mktemp)
+        if ! buildin GET "/api/docs/$PAGE_ID" > "$FRESH_FILE"; then
+            echo "Error: транзакция отправлена (discussion: $DISCUSSION), но проверить результат не удалось." >&2
+            echo "       Не повторяйте команду вслепую — сначала посмотрите блок на странице." >&2
+            exit 2
+        fi
+
+        VERDICT=$(python3 -c "
 import json, sys
 before_path, after_path, block_id, ours = sys.argv[1:5]
 
-def highlighted(path):
+def state(path):
     blocks = (json.load(open(path)).get('data') or {}).get('blocks') or {}
-    segments = (((blocks.get(block_id) or {}).get('data') or {}).get('segments')) or []
-    return {t for s in segments for t in (s.get('discussions') or [])}
+    block = blocks.get(block_id) or {}
+    segments = ((block.get('data') or {}).get('segments')) or []
+    return set(block.get('discussions') or []), {t for s in segments for t in (s.get('discussions') or [])}
 
-after = highlighted(after_path)
-if ours not in after:
-    sys.exit('Error: тред создан, но подсветка не закрепилась — блок перезаписали параллельно.\n'
-             '       Примените файл отката (путь выше) и повторите команду.')
-# База — снапшот, из которого строилась запись: наши сегменты его подсветку
-# сохраняют, поэтому пропажа означает чужую запись поверх нашей. Давно
-# осиротевшие треды в базе не подсвечены и ложной тревоги не дают.
-lost = sorted(highlighted(before_path) - after)
-if lost:
-    sys.stderr.write(
-        'ВНИМАНИЕ: параллельная запись лишила подсветки чужие треды: %s\n'
-        '          Они остались в списке блока, но на странице их не видно.\n' % ', '.join(lost))
-" "$DOC_FILE" "$FRESH_FILE" "$BLOCK_ID" "$DISCUSSION"
+before_listed, before_lit = state(before_path)
+after_listed, after_lit = state(after_path)
 
-        echo "discussion: $DISCUSSION" >&2
+# Базой служит СПИСОК тредов блока после записи, а не подсветка нашего
+# снапшота: треды, созданные параллельно, в снапшот попасть не могли, и
+# сверка с ним пропускала ровно тот случай, ради которого заведена.
+# listAfter аддитивен, поэтому в списке после записи есть и чужие треды.
+# Давно осиротевшие — те, что были в списке без подсветки ещё до нас, —
+# вычитаем: это не наша работа и не повод для тревоги.
+print('ok' if ours in after_lit else 'lost-ours')
+print(' '.join(sorted((after_listed - after_lit) - (before_listed - before_lit))))
+" "$DOC_FILE" "$FRESH_FILE" "$BLOCK_ID" "$DISCUSSION")
+
+        if [[ "$(echo "$VERDICT" | sed -n 1p)" != "ok" ]]; then
+            # Блок переписали поверх нас. Наших сегментов там уже нет, поэтому
+            # полный откат применять НЕЛЬЗЯ — он вернул бы наш снапшот и стёр
+            # подсветку победителя. Снимаем только свои записи.
+            echo "Error: тред создан, но подсветка не закрепилась — блок перезаписали параллельно." >&2
+            transaction "$SPACE_ID" "$(cat "$OPS_DIR/rollback_records.json")" > /dev/null
+            echo "       Тред $DISCUSSION снят: убран из блока и погашен. Чужие правки не тронуты." >&2
+            echo "       Файл отката $ROLLBACK_OUT применять НЕ надо — он вернёт устаревшие сегменты." >&2
+            echo "       Повторите команду: она возьмёт свежее состояние блока." >&2
+            exit 1
+        fi
+
+        # Именно if, а не «[[ … ]] && { … }»: это последняя команда ветки, и её
+        # статус стал бы кодом выхода всей команды — пустой список превращался
+        # бы в rc=1 на совершенно успешной записи.
+        LOST=$(echo "$VERDICT" | sed -n 2p)
+        if [[ -n "$LOST" ]]; then
+            echo "ВНИМАНИЕ: параллельная запись лишила подсветки чужие треды: ${LOST// /, }" >&2
+            echo "          Они остались в списке блока, но на странице их не видно." >&2
+            echo "          Текст цел — посмотреть: buildin-pages.sh comments $PAGE_ID $BLOCK_ID" >&2
+            echo "          Вернуть подсветку можно только новым комментарием: сама команда" >&2
+            echo "          не угадывает, к какой фразе чужой тред был привязан." >&2
+        fi
         ;;
 
     read)
@@ -972,7 +1023,8 @@ print(json.dumps(ops))
         echo "          [--dry-run] [--occurrence=N] [--rollback-out=<path>]"
         echo "                                           — комментарий к фразе <anchor> внутри блока"
         echo "                                             <anchor>/<text>: строка, @путь — файл, - — stdin"
-        echo "                                             (@@текст — литеральный @текст, -- — литеральный -)"
+        echo "                                             (@@текст — литеральный @текст; значение с ведущими"
+        echo "                                              дефисами — после разделителя --)"
         echo "                                             неоднозначный якорь — отказ, см. --occurrence=N"
         echo "  publish-md <id|url> <file.md> [--replace] — опубликовать markdown (по умолчанию в конец)"
         echo "  append-blocks <id|url> <json_blocks>     — добавить блоки в конец страницы"

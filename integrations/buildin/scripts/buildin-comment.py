@@ -24,8 +24,8 @@
 отвергается: молча привязать тред не туда хуже, чем не привязать вовсе.
 
 Usage:
-    buildin-comment.py <doc_json> <block_id> <anchor> <text> <now_ms> <user_id>
-                       [--occurrence N]
+    buildin-comment.py [--occurrence=N] -- <doc_json> <block_id> <anchor> <text>
+                       <now_ms> <user_id>
 
 <doc_json> — файл с ответом /api/docs (или «-» для stdin).
 --occurrence N — какое вхождение якоря выделить (1-based), когда их несколько.
@@ -58,14 +58,20 @@ def describe_segments(segments):
 
 
 def _all_offsets(text, anchor):
-    """Смещения всех вхождений якоря в видимом тексте, без перекрытий."""
+    """Смещения всех вхождений якоря в видимом тексте, включая перекрывающиеся.
+
+    Шаг в один символ, а не в длину якоря: «ана» в «банана» встречается дважды,
+    и поиск без перекрытий объявил бы такой якорь однозначным, молча выделив
+    самое левое место, — ровно та тихая привязка не туда, от которой заведён
+    отказ по неоднозначности.
+    """
     offsets, start = [], 0
     while True:
         i = text.find(anchor, start)
         if i == -1:
             return offsets
         offsets.append(i)
-        start = i + len(anchor)
+        start = i + 1
 
 
 def _locate(segments, offset, length):
@@ -262,12 +268,10 @@ def build_ops(block, block_id, anchor, text, now, user_id, occurrence=None):
          "args": {"updatedAt": now, "updatedBy": user_id}},
     ]
 
-    # Откат зеркалит запись: те же узкие операции в обратную сторону плюс
-    # гашение созданных записей (status -1 — конвенция удаления в этом плагине),
-    # чтобы после отката не осталось треда, который команда comments ещё видит.
-    rollback = [
-        {"id": block_id, "command": "update", "table": "block", "path": ["data"],
-         "args": {"segments": copy.deepcopy(segments)}},
+    # Снятие созданных записей: тред вон из списка блока, сам тред и сообщение
+    # гасятся (status -1 — конвенция удаления в этом плагине), чтобы после
+    # отката не осталось треда, который команда comments ещё видит.
+    retire = [
         {"id": block_id, "command": "listRemove", "table": "block", "path": ["discussions"],
          "args": {"uuid": discussion_id}},
         {"id": comment_id, "command": "update", "table": "comment", "path": [],
@@ -277,21 +281,35 @@ def build_ops(block, block_id, anchor, text, now, user_id, occurrence=None):
         {"id": block_id, "command": "update", "table": "block", "path": [],
          "args": {"updatedAt": now, "updatedBy": user_id}},
     ]
-    return {"ops": ops, "rollback": rollback, "discussion": discussion_id, "comment": comment_id}
+    # Полный откат — когда наша запись в блоке: возвращаем ещё и сегменты.
+    rollback = [
+        {"id": block_id, "command": "update", "table": "block", "path": ["data"],
+         "args": {"segments": copy.deepcopy(segments)}},
+    ] + retire
+    # Узкий откат — когда блок уже переписал кто-то другой. Возвращать наши
+    # сегменты там нельзя: в блоке лежат чужие, и восстановление снапшота
+    # стёрло бы подсветку того, кто выиграл гонку.
+    return {"ops": ops, "rollback": rollback, "rollback_records": retire,
+            "discussion": discussion_id, "comment": comment_id}
 
 
 def parse_args(argv):
-    positional, occurrence = [], None
+    positional, occurrence, end_of_opts = [], None, False
     for a in argv:
-        if a.startswith("--occurrence="):
+        if end_of_opts or not a.startswith("--"):
+            positional.append(a)
+        elif a == "--":
+            # Всё после «--» — значения. Без этого якорь или текст с ведущими
+            # дефисами («--force», «-- не согласен») не доходит до билдера
+            # никакой формой ввода: они едут через argv, в том числе из @file.
+            end_of_opts = True
+        elif a.startswith("--occurrence="):
             raw = a.split("=", 1)[1]
             if not raw.isdigit() or int(raw) < 1:
                 raise SystemExit("Error: --occurrence ожидает целое число >= 1, получено: %r" % raw)
             occurrence = int(raw)
-        elif a.startswith("--"):
-            raise SystemExit("Error: неизвестный флаг: %s" % a)
         else:
-            positional.append(a)
+            raise SystemExit("Error: неизвестный флаг: %s" % a)
     if len(positional) != 6:
         raise SystemExit(__doc__.strip())
     doc_json, block_id, anchor, text, now, user_id = positional
